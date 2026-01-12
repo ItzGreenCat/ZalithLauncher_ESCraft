@@ -14,6 +14,9 @@
 #include <android/dlext.h>
 #include <time.h>
 
+// [FIX] 必须包含这个头文件，否则找不到 pojav_environ
+#include <environ/environ.h>
+
 // 引入内部头文件
 #include <EGL/egl.h>
 #include "ctxbridges/egl_loader.h"
