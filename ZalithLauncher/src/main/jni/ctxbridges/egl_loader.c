@@ -44,7 +44,8 @@ static EGLBoolean hook_eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list
             EGLint attr = attrib_list[i];
             EGLint val = attrib_list[i+1];
             if (attr == EGL_RENDERABLE_TYPE) val = 0x0004; // ES2
-            if (attr == EGL_DEPTH_SIZE && val > 16) val = 16;
+            // 保持深度为 16 以获得最大兼容性
+            if (attr == EGL_DEPTH_SIZE) if (val > 16) val = 16;
             new_attribs[j++] = attr;
             new_attribs[j++] = val;
             i += 2;
@@ -69,6 +70,7 @@ static EGLContext hook_eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLCon
     }
     if (!has_ver) { new_attribs[j++] = 0x3098; new_attribs[j++] = 3; }
     new_attribs[j] = EGL_NONE;
+    
     EGLContext ctx = real_eglCreateContext(dpy, config, share_list, new_attribs);
     if (ctx == EGL_NO_CONTEXT && !has_ver) {
          new_attribs[j-2] = 2;
@@ -83,29 +85,27 @@ static EGLBoolean hook_eglBindAPI(EGLenum api) { return real_eglBindAPI(0x30A0);
 // 加载器入口
 // ============================================================================
 void dlsym_EGL() {
-    printf("egl_loader: [ABSOLUTE GLOBAL] Loading SYSTEM EGL...\n");
-    void* dl_handle = NULL;
-    
-    // [关键修改] 使用 RTLD_GLOBAL，让符号对 LWJGL 可见！
-    int flags = RTLD_GLOBAL | RTLD_LAZY;
+    printf("egl_loader: [FILENAME MODE] Loading 'libEGL.so' (RTLD_GLOBAL)...\n");
 
-    dl_handle = dlopen("/system/lib64/libEGL.so", flags);
-    if (!dl_handle) dl_handle = dlopen("/system/lib/libEGL.so", flags);
-    if (!dl_handle) dl_handle = dlopen("/vendor/lib64/libEGL.so", flags);
+    // [关键修正] 只使用文件名！让 Android Linker 自动在合法的 System 路径中查找。
+    // RTLD_GLOBAL 是为了让 LWJGL 能看见这些符号。
+    void* dl_handle = dlopen("libEGL.so", RTLD_GLOBAL | RTLD_LAZY);
 
     if (!dl_handle) {
-        printf("egl_loader: [FATAL] System EGL not found!\n");
+        printf("egl_loader: [FATAL] Failed to load 'libEGL.so'! Error: %s\n", dlerror());
+        printf("egl_loader: Please ensure no file named 'libEGL.so' exists in your app's lib directory.\n");
         abort();
     }
 
-    // 同时预加载 GLESv2，确保核心函数也就位
-    dlopen("/system/lib64/libGLESv2.so", flags);
-    dlopen("/system/lib/libGLESv2.so", flags);
+    // 预加载 GLESv2 确保核心函数就位
+    dlopen("libGLESv2.so", RTLD_GLOBAL | RTLD_LAZY);
 
+    // 加载原始指针
     real_eglChooseConfig = dlsym(dl_handle, "eglChooseConfig");
     real_eglCreateContext = dlsym(dl_handle, "eglCreateContext");
     real_eglBindAPI = dlsym(dl_handle, "eglBindAPI");
 
+    // 填充全局指针
     #define LOAD(name) name##_p = dlsym(dl_handle, #name);
     LOAD(eglMakeCurrent); LOAD(eglDestroyContext); LOAD(eglDestroySurface);
     LOAD(eglTerminate); LOAD(eglReleaseThread); LOAD(eglGetCurrentContext);
@@ -119,6 +119,6 @@ void dlsym_EGL() {
     eglCreateContext_p = hook_eglCreateContext;
     eglBindAPI_p = hook_eglBindAPI;
 
-    printf("egl_loader: System EGL loaded (GLOBAL mode).\n");
+    printf("egl_loader: System EGL loaded successfully.\n");
     if (eglBindAPI_p) eglBindAPI_p(0);
 }
