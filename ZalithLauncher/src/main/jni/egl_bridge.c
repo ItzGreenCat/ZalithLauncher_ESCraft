@@ -14,7 +14,7 @@
 #include <android/dlext.h>
 #include <time.h>
 
-// [FIX] 必须包含这个头文件，否则找不到 pojav_environ
+// [FIX 1] 包含环境头文件，解决 pojav_environ 未定义错误
 #include <environ/environ.h>
 
 // 引入内部头文件
@@ -36,12 +36,15 @@
 #define GLFW_OPENGL_API 0x30001
 #define GLFW_OPENGL_ES_API 0x30002
 
-#define EXTERNAL_API __attribute__((used))
+// [FIX 2] 定义可见性宏，解决链接错误
+#define EXTERNAL_API __attribute__((visibility("default"), used))
 #define ABI_COMPAT __attribute__((unused))
 
-// 声明全局变量
+// [FIX 3] 显式初始化全局变量并强制导出
+EXTERNAL_API EGLConfig config = NULL;
 struct PotatoBridge potatoBridge;
-void* loadTurnipVulkan(); // 保留 Vulkan 加载器以防万一
+
+void* loadTurnipVulkan(); 
 void calculateFPS();
 
 // =============================================================
@@ -50,7 +53,6 @@ void calculateFPS();
 static void force_system_gles_drivers() {
     printf("EGLBridge: [NUCLEAR OPTION] Forcing System GLES Drivers...\n");
 
-    // 1. 检测架构路径
     const char* sys_lib_path;
     if (sizeof(void*) == 8) {
         sys_lib_path = "/system/lib64/";
@@ -63,27 +65,22 @@ static void force_system_gles_drivers() {
     snprintf(path_egl, sizeof(path_egl), "%slibEGL.so", sys_lib_path);
     snprintf(path_gles, sizeof(path_gles), "%slibGLESv2.so", sys_lib_path);
 
-    // 2. 暴力覆盖环境变量
-    // 无论之前 Java 层设置了什么，这里全部覆盖为系统路径
+    // 暴力覆盖环境变量
     setenv("LIBGL_EGL", path_egl, 1);
     setenv("LIBGL_GLES", path_gles, 1);
     setenv("LIBGL_ES", path_gles, 1);
     
-    // 清除可能导致干扰的变量
     unsetenv("GALLIUM_DRIVER"); 
     unsetenv("MESA_LOADER_DRIVER_OVERRIDE");
 
     printf("EGLBridge: Redirected EGL to %s\n", path_egl);
     printf("EGLBridge: Redirected GLES to %s\n", path_gles);
 
-    // 3. 加载符号表 (这将打开上面的系统库)
-    // 我们复用 GL4ES 的 loader，因为它本质就是个 EGL Loader
     set_gl_bridge_tbl();
 }
 
 static void force_bind_gles_api() {
-    // 4. 动态查找并调用 eglBindAPI
-    // 这是防止回退到 Desktop GL 的最后一道防线
+    // 动态查找并调用 eglBindAPI
     void (*ptr_eglBindAPI)(EGLenum);
     ptr_eglBindAPI = dlsym(RTLD_DEFAULT, "eglBindAPI");
 
@@ -100,14 +97,26 @@ static void force_bind_gles_api() {
 // 初始化逻辑
 // =============================================================
 
-int pojavInitOpenGL() {
-    // VSync 控制
-    const char *forceVsync = getenv("FORCE_VSYNC");
-    if (forceVsync && !strcmp(forceVsync, "true"))
-        pojav_environ->force_vsync = true;
+// [FIX 4] 确保 load_vulkan 也是可见的，虽然它通常是内部使用
+void load_vulkan() {
+    const char* zinkPreferSystemDriver = getenv("POJAV_ZINK_PREFER_SYSTEM_DRIVER");
+    int deviceApiLevel = android_get_device_api_level();
+    if (zinkPreferSystemDriver == NULL && deviceApiLevel >= 28) {
+#ifdef ADRENO_POSSIBLE
+        void* result = loadTurnipVulkan();
+        if (result != NULL)
+        {
+            printf("AdrenoSupp: Loaded Turnip, loader address: %p\n", result);
+            
+             char envval[64];
+             sprintf(envval, "%"PRIxPTR, (uintptr_t)result);
+             setenv("VULKAN_PTR", envval, 1);
+            return;
+        }
+#endif
+    }
 
-    // 尝试加载 Vulkan (仅用于获取句柄，不用于渲染)
-    // 某些设备可能需要这个来唤醒 GPU
+    // Fallback loading
     if(getenv("VULKAN_PTR") == NULL) {
          void* vPtr = dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
          if (vPtr) {
@@ -116,9 +125,25 @@ int pojavInitOpenGL() {
              setenv("VULKAN_PTR", envval, 1);
          }
     }
+}
 
-    // [关键修改] 无视所有渲染器判断，直接走 EGL 路径
-    // RENDERER_GL4ES 在这里仅仅代表 "使用 egl_loader.c 的逻辑"
+// [FIX 5] 强制导出 maybe_load_vulkan，解决 lwjgl_dlopen_hook 链接错误
+EXTERNAL_API void* maybe_load_vulkan() {
+    if(getenv("VULKAN_PTR") == NULL) load_vulkan();
+    const char* ptrStr = getenv("VULKAN_PTR");
+    if (ptrStr == NULL) return NULL;
+    return (void*) strtoul(ptrStr, NULL, 0x10);
+}
+
+int pojavInitOpenGL() {
+    const char *forceVsync = getenv("FORCE_VSYNC");
+    if (forceVsync && !strcmp(forceVsync, "true"))
+        pojav_environ->force_vsync = true;
+
+    // 确保 Vulkan 句柄已加载
+    maybe_load_vulkan();
+
+    // 强制走 GL4ES (EGL) 路径
     pojav_environ->config_renderer = RENDERER_GL4ES;
 
     // 执行强制加载
@@ -127,7 +152,6 @@ int pojavInitOpenGL() {
     // 执行强制绑定
     force_bind_gles_api();
 
-    // 初始化 EGL 上下文
     if (br_init()) {
         br_setup_window();
     } else {
@@ -143,7 +167,6 @@ EXTERNAL_API int pojavInit() {
     pojav_environ->savedWidth = ANativeWindow_getWidth(pojav_environ->pojavWindow);
     pojav_environ->savedHeight = ANativeWindow_getHeight(pojav_environ->pojavWindow);
     
-    // 强制设置为 RGBA_8888，这是 GLES 最通用的格式
     ANativeWindow_setBuffersGeometry(pojav_environ->pojavWindow, 
                                      pojav_environ->savedWidth, 
                                      pojav_environ->savedHeight, 
@@ -152,16 +175,9 @@ EXTERNAL_API int pojavInit() {
     return pojavInitOpenGL();
 }
 
-// =============================================================
-// Window Hint (API 拦截)
-// =============================================================
 EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
     if (hint != GLFW_CLIENT_API) return;
 
-    // [关键修改] 无论 Java 请求 Desktop GL 还是 ES，全部放行
-    // 因为我们在 init 里已经强制绑定了 eglBindAPI(ES)，
-    // 所以即使 GLFW 请求 Desktop，得到的也会是 ES (或者报错，取决于 EGL 实现)
-    // 但在这里拦截是为了防止 Native Bridge 报错 "Unimplemented"
     switch (value) {
         case GLFW_NO_API:
             pojav_environ->config_renderer = RENDERER_VULKAN;
@@ -177,13 +193,8 @@ EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
     }
 }
 
-// =============================================================
-// 其他辅助函数 (保持精简)
-// =============================================================
-
 EXTERNAL_API void pojavTerminate() {
     printf("EGLBridge: Terminating\n");
-    // 既然强制走了 GL4ES (EGL) 路径，这里只需要处理清理逻辑
     if (potatoBridge.eglDisplay) {
         eglMakeCurrent_p(potatoBridge.eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (potatoBridge.eglSurface) eglDestroySurface_p(potatoBridge.eglDisplay, potatoBridge.eglSurface);
@@ -194,29 +205,23 @@ EXTERNAL_API void pojavTerminate() {
     memset(&potatoBridge, 0, sizeof(potatoBridge));
 }
 
-// 窗口交换
 EXTERNAL_API void pojavSwapBuffers() {
     calculateFPS();
-    br_swap_buffers(); // 直接调用 EGL swap
+    br_swap_buffers(); 
 }
 
-// Make Current
 EXTERNAL_API void pojavMakeCurrent(void* window) {
     br_make_current((basic_render_window_t*)window);
 }
 
-// 上下文创建
 EXTERNAL_API void* pojavCreateContext(void* contextSrc) {
-    // 强制调用 EGL 创建
     return br_init_context((basic_render_window_t*)contextSrc);
 }
 
-// VSync
 EXTERNAL_API void pojavSwapInterval(int interval) {
     br_swap_interval(interval);
 }
 
-// JNI 接口 - 窗口设置
 JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_utils_JREUtils_setupBridgeWindow(JNIEnv* env, ABI_COMPAT jclass clazz, jobject surface) {
     pojav_environ->pojavWindow = ANativeWindow_fromSurface(env, surface);
     if (br_setup_window) br_setup_window();
@@ -232,7 +237,6 @@ EXTERNAL_API void* pojavGetCurrentContext() {
     return br_get_current();
 }
 
-// FPS 计数器
 static int frameCount = 0;
 static int fps = 0;
 static time_t lastTime = 0;
@@ -249,11 +253,6 @@ EXTERNAL_API JNIEXPORT jint JNICALL Java_org_lwjgl_glfw_CallbackBridge_getCurren
     return fps;
 }
 
-// Vulkan 句柄获取 (兼容性保留)
 EXTERNAL_API JNIEXPORT jlong JNICALL Java_org_lwjgl_vulkan_VK_getVulkanDriverHandle(ABI_COMPAT JNIEnv *env, ABI_COMPAT jclass thiz) {
-    if(getenv("VULKAN_PTR") == NULL) {
-         void* vPtr = dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
-         return (jlong)vPtr;
-    }
-    return (jlong) strtoul(getenv("VULKAN_PTR"), NULL, 0x10);
+    return (jlong) maybe_load_vulkan();
 }
