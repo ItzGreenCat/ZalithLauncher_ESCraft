@@ -32,23 +32,30 @@
 EXTERNAL_API EGLConfig config = NULL;
 EXTERNAL_API struct PotatoBridge potatoBridge;
 
+// ==========================================================================
+// [关键] GLESv2 库句柄
+// ==========================================================================
+static void* g_GLESv2_Handle = NULL;
+
 // --------------------------------------------------------------------------
-// [核心] LWJGL 函数获取器
+// [核心修复] 函数地址获取器
 // --------------------------------------------------------------------------
 EXTERNAL_API void* pojavGetProcAddress(const char* procname) {
-    // 1. 先尝试全局查找 (得益于 egl_loader.c 的 RTLD_GLOBAL，这应该能成)
-    void* addr = dlsym(RTLD_DEFAULT, procname);
-    if (addr) return addr;
+    if (!procname) return NULL;
 
-    // 2. 如果不行，手动加载 libGLESv2.so (使用文件名，让 Linker 自己找)
-    static void* sys_gles = NULL;
-    if (!sys_gles) {
-        // 使用 RTLD_GLOBAL 再次尝试暴露符号
-        sys_gles = dlopen("libGLESv2.so", RTLD_GLOBAL | RTLD_LAZY);
-        if (!sys_gles) sys_gles = dlopen("/system/lib64/libGLESv2.so", RTLD_GLOBAL | RTLD_LAZY);
+    // 1. 必须优先从 libGLESv2.so 中寻找核心函数 (如 glGetString)
+    // Android 的 eglGetProcAddress 不会返回这些核心函数！
+    if (g_GLESv2_Handle) {
+        void* addr = dlsym(g_GLESv2_Handle, procname);
+        if (addr) return addr;
     }
+
+    // 2. 如果核心库里没有，再尝试 RTLD_DEFAULT (可能在 EGL 里)
+    void* addr = dlsym(RTLD_DEFAULT, procname);
     
-    if (sys_gles) addr = dlsym(sys_gles, procname);
+    // 3. 调试日志 (如果还是崩，开启这个看看到底哪个函数没找到)
+    // if (!addr) printf("EGLBridge: Failed to resolve symbol: %s\n", procname);
+
     return addr;
 }
 
@@ -56,12 +63,35 @@ EXTERNAL_API void* pojavGetProcAddress(const char* procname) {
 // 初始化
 // --------------------------------------------------------------------------
 int pojavInitOpenGL() {
-    printf("EGLBridge: Force SYSTEM GLES (Global Scope)...\n");
+    printf("EGLBridge: Force SYSTEM GLES (Hardcoded Path)...\n");
+
+    // [关键] 显式加载 GLESv2 库，并保存句柄
+    // 必须用绝对路径，防止加载到 gl4es
+    if (!g_GLESv2_Handle) {
+        g_GLESv2_Handle = dlopen("/system/lib64/libGLESv2.so", RTLD_LOCAL | RTLD_LAZY);
+        if (!g_GLESv2_Handle) {
+            g_GLESv2_Handle = dlopen("/system/lib/libGLESv2.so", RTLD_LOCAL | RTLD_LAZY);
+        }
+        if (!g_GLESv2_Handle) {
+             g_GLESv2_Handle = dlopen("/vendor/lib64/libGLESv2.so", RTLD_LOCAL | RTLD_LAZY);
+        }
+        
+        if (g_GLESv2_Handle) {
+            printf("EGLBridge: Loaded libGLESv2.so successfully at %p\n", g_GLESv2_Handle);
+        } else {
+            printf("EGLBridge: [FATAL] Failed to load libGLESv2.so! dlerror: %s\n", dlerror());
+            // 如果连 GLESv2 都加载不到，glGetString 必崩
+            abort(); 
+        }
+    }
+
+    // 设置环境
     pojav_environ->config_renderer = RENDERER_GL4ES;
     unsetenv("LIBGL_EGL");
     unsetenv("LIBGL_GLES");
     unsetenv("POJAVEXEC_EGL");
 
+    // 调用 loader (egl_loader.c)
     set_gl_bridge_tbl(); 
     
     if (br_init()) {
@@ -78,16 +108,18 @@ EXTERNAL_API int pojavInit() {
     ANativeWindow_acquire(pojav_environ->pojavWindow);
     pojav_environ->savedWidth = ANativeWindow_getWidth(pojav_environ->pojavWindow);
     pojav_environ->savedHeight = ANativeWindow_getHeight(pojav_environ->pojavWindow);
+    
     ANativeWindow_setBuffersGeometry(pojav_environ->pojavWindow, 
                                      pojav_environ->savedWidth, 
                                      pojav_environ->savedHeight, 
                                      AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
     setenv("VULKAN_PTR", "0", 1); 
+
     if (pojavInitOpenGL() != 0) return 0;
     return 1;
 }
 
-EXTERNAL_API void pojavSetWindowHint(int hint, int value) { /* Hooked */ }
+EXTERNAL_API void pojavSetWindowHint(int hint, int value) { /* Hooked inside egl_loader */ }
 EXTERNAL_API void* pojavCreateContext(void* contextSrc) { return br_init_context((basic_render_window_t*)contextSrc); }
 EXTERNAL_API void pojavSwapBuffers() { br_swap_buffers(); }
 EXTERNAL_API void pojavMakeCurrent(void* window) { br_make_current((basic_render_window_t*)window); }
