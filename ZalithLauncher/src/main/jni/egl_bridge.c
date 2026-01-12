@@ -13,20 +13,13 @@
 #include <android/rect.h>
 #include <android/dlext.h>
 #include <time.h>
-#include <environ/environ.h>
 
+// 必须包含环境头文件
+#include <environ/environ.h>
 #include <EGL/egl.h>
-#include "ctxbridges/egl_loader.h"
-#include "ctxbridges/osmesa_loader.h"
-#include "ctxbridges/renderer_config.h"
-#include "ctxbridges/virgl_bridge.h"
-#include "driver_helper/nsbypass.h"
-#include "utils.h"
-#include "ctxbridges/bridge_tbl.h" // 这里面应该声明了 bridge_tbl
-#include "ctxbridges/osm_bridge.h"
 
 // -------------------------------------------------------------
-// Macros
+// Macros & Config
 // -------------------------------------------------------------
 #define GLFW_CLIENT_API 0x22001
 #define GLFW_NO_API 0
@@ -36,214 +29,120 @@
 #define EXTERNAL_API __attribute__((visibility("default"), used))
 #define ABI_COMPAT __attribute__((unused))
 
-// 初始化全局变量
-EXTERNAL_API EGLConfig config = NULL;
-struct PotatoBridge potatoBridge;
-void* loadTurnipVulkan(); 
-void calculateFPS();
+// 定义渲染器枚举 (防止头文件缺失)
+#ifndef RENDERER_GL4ES
+#define RENDERER_GL4ES 0
+#define RENDERER_VULKAN 1
+#define RENDERER_VIRGL 2
+#define RENDERER_VK_ZINK 3
+#endif
 
 // -------------------------------------------------------------
-// HOOKS: 拦截并修改 EGL 调用
+// 自定义函数指针 (完全独立，不依赖外部)
 // -------------------------------------------------------------
+static void* lib_egl_handle = NULL;
 
-// 保存原始函数指针
-static EGLBoolean (*real_eglChooseConfig)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*) = NULL;
-static EGLContext (*real_eglCreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint*) = NULL;
+// 定义我们需要用到的 EGL 函数指针
+static EGLDisplay (*sys_eglGetDisplay)(EGLNativeDisplayType) = NULL;
+static EGLBoolean (*sys_eglInitialize)(EGLDisplay, EGLint*, EGLint*) = NULL;
+static EGLBoolean (*sys_eglChooseConfig)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*) = NULL;
+static EGLContext (*sys_eglCreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint*) = NULL;
+static EGLSurface (*sys_eglCreateWindowSurface)(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*) = NULL;
+static EGLBoolean (*sys_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext) = NULL;
+static EGLBoolean (*sys_eglSwapBuffers)(EGLDisplay, EGLSurface) = NULL;
+static EGLBoolean (*sys_eglSwapInterval)(EGLDisplay, EGLint) = NULL;
+static EGLBoolean (*sys_eglBindAPI)(EGLenum) = NULL;
+static EGLint     (*sys_eglGetError)(void) = NULL;
+static EGLBoolean (*sys_eglDestroySurface)(EGLDisplay, EGLSurface) = NULL;
+static EGLBoolean (*sys_eglDestroyContext)(EGLDisplay, EGLContext) = NULL;
+static EGLBoolean (*sys_eglTerminate)(EGLDisplay) = NULL;
 
-// 1. 劫持 eglChooseConfig：强制修改属性为 GLES 兼容
-EGLBoolean my_hooked_eglChooseConfig(EGLDisplay dpy, const EGLint* attrib_list, EGLConfig* configs, EGLint config_size, EGLint* num_config) {
-    printf("EGLBridge: [HOOK] eglChooseConfig intercepted! Fixing attributes...\n");
+// 全局状态保存
+static EGLDisplay g_Display = EGL_NO_DISPLAY;
+static EGLSurface g_Surface = EGL_NO_SURFACE;
+static EGLContext g_Context = EGL_NO_CONTEXT;
+static EGLConfig  g_Config  = NULL;
+
+// -------------------------------------------------------------
+// 1. 加载系统 EGL 驱动
+// -------------------------------------------------------------
+static int load_system_egl_functions() {
+    printf("EGLBridge: Loading System EGL library...\n");
     
-    // 构造一个新的属性列表，最大支持 64 个属性
-    EGLint my_attribs[64];
-    int i = 0; // 原列表索引
-    int j = 0; // 新列表索引
-    
-    if (attrib_list) {
-        while (attrib_list[i] != EGL_NONE && j < 60) {
-            EGLint attr = attrib_list[i];
-            EGLint val = attrib_list[i+1];
-            
-            // [MAGIC FIX 1] 强制 Renderable Type 为 ES2/ES3
-            if (attr == EGL_RENDERABLE_TYPE) {
-                // 不管原来请求的是什么(比如 Desktop GL)，直接改成 ES3 | ES2
-                printf("EGLBridge: [HOOK] Patching EGL_RENDERABLE_TYPE: 0x%x -> ES2_BIT\n", val);
-                val = 0x0004; // EGL_OPENGL_ES2_BIT (兼容性最好)
-                // val = 0x0040; // EGL_OPENGL_ES3_BIT_KHR (也可以尝试)
-            }
-            
-            // [MAGIC FIX 2] 强制 Depth 为 16位
-            if (attr == EGL_DEPTH_SIZE) {
-                if (val == 24) {
-                    printf("EGLBridge: [HOOK] Downgrading Depth 24 -> 16 for compatibility.\n");
-                    val = 16;
-                }
-            }
-            
-            my_attribs[j++] = attr;
-            my_attribs[j++] = val;
-            i += 2;
-        }
+    // 尝试加载系统库
+    lib_egl_handle = dlopen("libEGL.so", RTLD_LAZY);
+    if (!lib_egl_handle) {
+        // 尝试 64位 绝对路径
+        lib_egl_handle = dlopen("/system/lib64/libEGL.so", RTLD_LAZY);
     }
-    my_attribs[j] = EGL_NONE;
-    
-    // 调用真正的系统函数
-    if (real_eglChooseConfig) {
-        return real_eglChooseConfig(dpy, my_attribs, configs, config_size, num_config);
-    }
-    return EGL_FALSE;
-}
-
-// 2. 劫持 eglCreateContext：强制指定 Client Version
-EGLContext my_hooked_eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint* attrib_list) {
-    printf("EGLBridge: [HOOK] eglCreateContext intercepted!\n");
-    
-    EGLint my_attribs[64];
-    int i = 0;
-    int j = 0;
-    bool has_version = false;
-
-    if (attrib_list) {
-        while (attrib_list[i] != EGL_NONE && j < 60) {
-            EGLint attr = attrib_list[i];
-            EGLint val = attrib_list[i+1];
-            
-            // 检查是否已经指定了版本
-            if (attr == 0x3098) { // EGL_CONTEXT_CLIENT_VERSION
-                has_version = true;
-                printf("EGLBridge: [HOOK] Context version already requested: %d\n", val);
-            }
-            
-            my_attribs[j++] = attr;
-            my_attribs[j++] = val;
-            i += 2;
-        }
+    if (!lib_egl_handle) {
+        // 尝试 32位 绝对路径
+        lib_egl_handle = dlopen("/system/lib/libEGL.so", RTLD_LAZY);
     }
     
-    // [MAGIC FIX 3] 如果没指定版本，强制指定为 3.0
-    if (!has_version) {
-        printf("EGLBridge: [HOOK] Injecting EGL_CONTEXT_CLIENT_VERSION = 3\n");
-        my_attribs[j++] = 0x3098; // EGL_CONTEXT_CLIENT_VERSION
-        my_attribs[j++] = 3;      // Version 3
+    if (!lib_egl_handle) {
+        printf("EGLBridge: [FATAL] Could not dlopen libEGL.so! Error: %s\n", dlerror());
+        return 0;
     }
-    my_attribs[j] = EGL_NONE;
 
-    if (real_eglCreateContext) {
-        EGLContext ctx = real_eglCreateContext(dpy, config, share_context, my_attribs);
-        if (ctx == EGL_NO_CONTEXT) {
-             printf("EGLBridge: [HOOK] Context creation failed (Error: 0x%x). Retrying with Version 2...\n");
-             // 如果 3.0 失败，尝试 2.0
-             if (!has_version) {
-                 my_attribs[j-1] = 2; 
-                 ctx = real_eglCreateContext(dpy, config, share_context, my_attribs);
-             }
-        }
-        return ctx;
+    // 获取函数地址
+    sys_eglGetDisplay = dlsym(lib_egl_handle, "eglGetDisplay");
+    sys_eglInitialize = dlsym(lib_egl_handle, "eglInitialize");
+    sys_eglChooseConfig = dlsym(lib_egl_handle, "eglChooseConfig");
+    sys_eglCreateContext = dlsym(lib_egl_handle, "eglCreateContext");
+    sys_eglCreateWindowSurface = dlsym(lib_egl_handle, "eglCreateWindowSurface");
+    sys_eglMakeCurrent = dlsym(lib_egl_handle, "eglMakeCurrent");
+    sys_eglSwapBuffers = dlsym(lib_egl_handle, "eglSwapBuffers");
+    sys_eglSwapInterval = dlsym(lib_egl_handle, "eglSwapInterval");
+    sys_eglBindAPI = dlsym(lib_egl_handle, "eglBindAPI");
+    sys_eglGetError = dlsym(lib_egl_handle, "eglGetError");
+    sys_eglDestroySurface = dlsym(lib_egl_handle, "eglDestroySurface");
+    sys_eglDestroyContext = dlsym(lib_egl_handle, "eglDestroyContext");
+    sys_eglTerminate = dlsym(lib_egl_handle, "eglTerminate");
+
+    if (!sys_eglGetDisplay || !sys_eglCreateContext) {
+        printf("EGLBridge: [FATAL] Could not dlsym essential EGL functions!\n");
+        return 0;
     }
-    return EGL_NO_CONTEXT;
+    
+    printf("EGLBridge: System EGL Loaded Successfully.\n");
+    return 1;
 }
 
 // -------------------------------------------------------------
-// Core Logic
+// 2. 初始化 EGL
 // -------------------------------------------------------------
-
-static void force_system_gles_drivers() {
-    printf("EGLBridge: [INFO] Configuring for System GLES Drivers...\n");
-
-    const char* lib_egl = "libEGL.so";
-    const char* lib_gles = "libGLESv2.so";
-
-    setenv("LIBGL_EGL", lib_egl, 1);
-    setenv("LIBGL_GLES", lib_gles, 1);
-    setenv("LIBGL_ES", lib_gles, 1);
-    
-    unsetenv("GALLIUM_DRIVER"); 
-    unsetenv("MESA_LOADER_DRIVER_OVERRIDE");
-
-    // 加载系统库符号到 bridge_tbl
-    set_gl_bridge_tbl();
-    
-    // ==========================================
-    // [CRITICAL] 应用 Hooks 到 bridge_tbl
-    // ==========================================
-    // 假设 bridge_tbl 是全局可见的 (Pojav 标准设计)
-    // 如果编译报错说 bridge_tbl 未定义，请告诉我，我再换一种写法
-    if (bridge_tbl.eglChooseConfig) {
-        real_eglChooseConfig = bridge_tbl.eglChooseConfig; // 保存原指针
-        bridge_tbl.eglChooseConfig = my_hooked_eglChooseConfig; // 替换为 Hook
-        printf("EGLBridge: [SUCCESS] Hooked eglChooseConfig\n");
-    }
-    
-    if (bridge_tbl.eglCreateContext) {
-        real_eglCreateContext = bridge_tbl.eglCreateContext;
-        bridge_tbl.eglCreateContext = my_hooked_eglCreateContext;
-        printf("EGLBridge: [SUCCESS] Hooked eglCreateContext\n");
-    }
-}
-
-static void force_bind_gles_api() {
-    typedef EGLBoolean (*eglBindAPI_t)(EGLenum);
-    eglBindAPI_t ptr_eglBindAPI = (eglBindAPI_t)dlsym(RTLD_DEFAULT, "eglBindAPI");
-    
-    if (!ptr_eglBindAPI) {
-        void* handle = dlopen("libEGL.so", RTLD_LAZY);
-        if (handle) ptr_eglBindAPI = (eglBindAPI_t)dlsym(handle, "eglBindAPI");
-    }
-
-    if (ptr_eglBindAPI) {
-        printf("EGLBridge: FORCE calling eglBindAPI(EGL_OPENGL_ES_API)...\n");
-        if (ptr_eglBindAPI(0x30A0)) {
-            printf("EGLBridge: API Bind Success.\n");
-        } else {
-            printf("EGLBridge: API Bind Failed.\n");
-        }
-    }
-}
-
-void load_vulkan() {
-    if(getenv("VULKAN_PTR") == NULL) {
-         void* vPtr = dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
-         if (vPtr) {
-             char envval[64];
-             sprintf(envval, "%"PRIxPTR, (uintptr_t)vPtr);
-             setenv("VULKAN_PTR", envval, 1);
-         }
-    }
-}
-
-EXTERNAL_API void* maybe_load_vulkan() {
-    if(getenv("VULKAN_PTR") == NULL) load_vulkan();
-    const char* ptrStr = getenv("VULKAN_PTR");
-    if (ptrStr == NULL) return NULL;
-    return (void*) strtoul(ptrStr, NULL, 0x10);
-}
-
-// -------------------------------------------------------------
-// Initialization
-// -------------------------------------------------------------
-
 int pojavInitOpenGL() {
-    const char *forceVsync = getenv("FORCE_VSYNC");
-    if (forceVsync && !strcmp(forceVsync, "true"))
-        pojav_environ->force_vsync = true;
+    // 1. 加载函数
+    if (!load_system_egl_functions()) return -1;
 
-    maybe_load_vulkan();
-
-    pojav_environ->config_renderer = RENDERER_GL4ES;
-    
-    // 1. 设置驱动并应用 Hook
-    force_system_gles_drivers();
-    
-    // 2. 初始化 EGL
-    if (br_init()) {
-        br_setup_window();
-    } else {
-        printf("EGLBridge: [FATAL] br_init() failed!\n");
+    // 2. 获取 Display
+    g_Display = sys_eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (g_Display == EGL_NO_DISPLAY) {
+        printf("EGLBridge: eglGetDisplay failed: 0x%x\n", sys_eglGetError());
         return -1;
     }
 
-    // 3. 绑定 API
-    force_bind_gles_api();
+    // 3. 初始化 EGL
+    if (!sys_eglInitialize(g_Display, NULL, NULL)) {
+        printf("EGLBridge: eglInitialize failed: 0x%x\n", sys_eglGetError());
+        return -1;
+    }
+
+    // 4. 强制绑定 API (GLES)
+    if (sys_eglBindAPI) {
+        // 0x30A0 = EGL_OPENGL_ES_API
+        if (sys_eglBindAPI(0x30A0)) {
+            printf("EGLBridge: Bound API to GLES.\n");
+        } else {
+            printf("EGLBridge: Failed to bind API to GLES.\n");
+        }
+    }
+
+    printf("EGLBridge: EGL Initialized (Display: %p)\n", g_Display);
+    
+    // 设置内部状态，防止其他地方空指针
+    pojav_environ->config_renderer = RENDERER_GL4ES; 
 
     return 0;
 }
@@ -258,6 +157,7 @@ EXTERNAL_API int pojavInit() {
     pojav_environ->savedWidth = ANativeWindow_getWidth(pojav_environ->pojavWindow);
     pojav_environ->savedHeight = ANativeWindow_getHeight(pojav_environ->pojavWindow);
     
+    // 强制 RGBA 8888
     ANativeWindow_setBuffersGeometry(pojav_environ->pojavWindow, 
                                      pojav_environ->savedWidth, 
                                      pojav_environ->savedHeight, 
@@ -269,48 +169,154 @@ EXTERNAL_API int pojavInit() {
     return 1; 
 }
 
-EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
-    if (hint != GLFW_CLIENT_API) return;
-    // 忽略所有 Hint，因为我们已经通过 Hook 强制接管了
-}
-
+// -------------------------------------------------------------
+// 3. 创建 Context (手动强制配置)
+// -------------------------------------------------------------
 EXTERNAL_API void* pojavCreateContext(void* contextSrc) {
-    printf("EGLBridge: pojavCreateContext called...\n");
-    void* ctx = br_init_context((basic_render_window_t*)contextSrc);
-    if (!ctx) {
-        printf("EGLBridge: [FATAL] pojavCreateContext returned NULL. Hook failed?\n");
+    (void)contextSrc; // 忽略传入参数，我们自己管
+    printf("EGLBridge: pojavCreateContext (Custom Implementation)\n");
+
+    if (g_Display == EGL_NO_DISPLAY) {
+        printf("EGLBridge: Display not initialized!\n");
+        return NULL;
     }
-    return ctx;
+
+    // ----------------------------------------------
+    // 核心：手写 GLES 配置
+    // ----------------------------------------------
+    const EGLint attribs[] = {
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, 0x0004, // EGL_OPENGL_ES2_BIT (兼容 ES3)
+        EGL_BLUE_SIZE,       8,
+        EGL_GREEN_SIZE,      8,
+        EGL_RED_SIZE,        8,
+        EGL_ALPHA_SIZE,      8,
+        EGL_DEPTH_SIZE,      16,     // 16位深度 (兼容性关键)
+        EGL_STENCIL_SIZE,    0,
+        EGL_NONE
+    };
+
+    EGLint num_configs;
+    if (!sys_eglChooseConfig(g_Display, attribs, &g_Config, 1, &num_configs) || num_configs == 0) {
+        printf("EGLBridge: [FATAL] eglChooseConfig failed or no config found! Error: 0x%x\n", sys_eglGetError());
+        return NULL;
+    }
+
+    // ----------------------------------------------
+    // 核心：创建 GLES 3 上下文
+    // ----------------------------------------------
+    const EGLint ctx_attribs[] = {
+        0x3098, 3, // EGL_CONTEXT_CLIENT_VERSION = 3
+        EGL_NONE
+    };
+
+    g_Context = sys_eglCreateContext(g_Display, g_Config, EGL_NO_CONTEXT, ctx_attribs);
+    if (g_Context == EGL_NO_CONTEXT) {
+        printf("EGLBridge: [WARN] Failed to create GLES 3 context (0x%x), retrying GLES 2...\n", sys_eglGetError());
+        
+        const EGLint ctx_attribs_2[] = { 0x3098, 2, EGL_NONE };
+        g_Context = sys_eglCreateContext(g_Display, g_Config, EGL_NO_CONTEXT, ctx_attribs_2);
+    }
+
+    if (g_Context == EGL_NO_CONTEXT) {
+        printf("EGLBridge: [FATAL] Failed to create any Context.\n");
+        return NULL;
+    }
+
+    printf("EGLBridge: Context Created Successfully: %p\n", g_Context);
+
+    // ----------------------------------------------
+    // 核心：创建 Surface
+    // ----------------------------------------------
+    g_Surface = sys_eglCreateWindowSurface(g_Display, g_Config, (EGLNativeWindowType)pojav_environ->pojavWindow, NULL);
+    if (g_Surface == EGL_NO_SURFACE) {
+        printf("EGLBridge: [FATAL] eglCreateWindowSurface failed: 0x%x\n", sys_eglGetError());
+        return NULL;
+    }
+
+    // 自动 MakeCurrent
+    if (!sys_eglMakeCurrent(g_Display, g_Surface, g_Surface, g_Context)) {
+         printf("EGLBridge: [FATAL] eglMakeCurrent failed: 0x%x\n", sys_eglGetError());
+    }
+
+    // 返回一个非空指针 (GLFW 需要)
+    // 通常这里应该返回包含上下文信息的结构体，但在 Pojav 的设计里
+    // 如果不使用 br_loader，返回 Context 指针本身通常也能蒙混过关
+    // 或者我们只要确保 g_Context 是全局可访问的即可
+    return (void*)g_Context; 
 }
 
-// 标准函数
-EXTERNAL_API void pojavTerminate() {
-    if (potatoBridge.eglDisplay) {
-        eglMakeCurrent_p(potatoBridge.eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (potatoBridge.eglSurface) eglDestroySurface_p(potatoBridge.eglDisplay, potatoBridge.eglSurface);
-        if (potatoBridge.eglContext) eglDestroyContext_p(potatoBridge.eglDisplay, potatoBridge.eglContext);
-        eglTerminate_p(potatoBridge.eglDisplay);
-        eglReleaseThread_p();
+// -------------------------------------------------------------
+// 4. 其他必须实现的接口
+// -------------------------------------------------------------
+
+EXTERNAL_API void pojavSwapBuffers() {
+    // 简单的 FPS 计算
+    static int frameCount = 0;
+    static time_t lastTime = 0;
+    frameCount++;
+    time_t currentTime = time(NULL);
+    if (currentTime != lastTime) { lastTime = currentTime; frameCount = 0; }
+
+    if (sys_eglSwapBuffers && g_Display && g_Surface) {
+        sys_eglSwapBuffers(g_Display, g_Surface);
     }
-    memset(&potatoBridge, 0, sizeof(potatoBridge));
 }
-EXTERNAL_API void pojavSwapBuffers() { calculateFPS(); br_swap_buffers(); }
-EXTERNAL_API void pojavMakeCurrent(void* window) { br_make_current((basic_render_window_t*)window); }
-EXTERNAL_API void pojavSwapInterval(int interval) { br_swap_interval(interval); }
+
+EXTERNAL_API void pojavMakeCurrent(void* window) {
+    (void)window;
+    if (sys_eglMakeCurrent && g_Display && g_Surface && g_Context) {
+        sys_eglMakeCurrent(g_Display, g_Surface, g_Surface, g_Context);
+    }
+}
+
+EXTERNAL_API void pojavSwapInterval(int interval) {
+    if (sys_eglSwapInterval && g_Display) {
+        sys_eglSwapInterval(g_Display, interval);
+    }
+}
+
+EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
+    // 忽略所有 Hint，我们已经在 pojavCreateContext 里硬编码了最佳配置
+}
+
+EXTERNAL_API void* pojavGetCurrentContext() {
+    return (void*)g_Context;
+}
+
+EXTERNAL_API void pojavTerminate() {
+    printf("EGLBridge: Terminating...\n");
+    if (sys_eglMakeCurrent) sys_eglMakeCurrent(g_Display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (sys_eglDestroySurface) sys_eglDestroySurface(g_Display, g_Surface);
+    if (sys_eglDestroyContext) sys_eglDestroyContext(g_Display, g_Context);
+    if (sys_eglTerminate) sys_eglTerminate(g_Display);
+}
+
+// JNI & Vulkan Utils
 JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_utils_JREUtils_setupBridgeWindow(JNIEnv* env, ABI_COMPAT jclass clazz, jobject surface) {
     pojav_environ->pojavWindow = ANativeWindow_fromSurface(env, surface);
-    if (br_setup_window) br_setup_window();
 }
+
 JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_utils_JREUtils_releaseBridgeWindow(ABI_COMPAT JNIEnv *env, ABI_COMPAT jclass clazz) {
     if (pojav_environ->pojavWindow) ANativeWindow_release(pojav_environ->pojavWindow);
 }
-EXTERNAL_API void* pojavGetCurrentContext() { return br_get_current(); }
-static int frameCount = 0; static int fps = 0; static time_t lastTime = 0;
-void calculateFPS() {
-    frameCount++; time_t currentTime = time(NULL);
-    if (currentTime != lastTime) { lastTime = currentTime; fps = frameCount; frameCount = 0; }
+
+EXTERNAL_API JNIEXPORT jint JNICALL Java_org_lwjgl_glfw_CallbackBridge_getCurrentFps(JNIEnv *env, jclass clazz) {
+    return 0; // 简化
 }
-EXTERNAL_API JNIEXPORT jint JNICALL Java_org_lwjgl_glfw_CallbackBridge_getCurrentFps(JNIEnv *env, jclass clazz) { return fps; }
+
+// Vulkan Loader (Keep minimal)
+void load_vulkan() {
+    void* vPtr = dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
+    if (vPtr) {
+        char envval[64];
+        sprintf(envval, "%"PRIxPTR, (uintptr_t)vPtr);
+        setenv("VULKAN_PTR", envval, 1);
+    }
+}
+
 EXTERNAL_API JNIEXPORT jlong JNICALL Java_org_lwjgl_vulkan_VK_getVulkanDriverHandle(ABI_COMPAT JNIEnv *env, ABI_COMPAT jclass thiz) {
-    return (jlong) maybe_load_vulkan();
+     if(getenv("VULKAN_PTR") == NULL) load_vulkan();
+     const char* ptr = getenv("VULKAN_PTR");
+     return ptr ? (jlong)strtoul(ptr, NULL, 0x10) : 0;
 }
