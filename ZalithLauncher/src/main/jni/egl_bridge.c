@@ -21,10 +21,6 @@
 #include "utils.h"
 #include "ctxbridges/bridge_tbl.h"
 
-// 那些 VirGL 的引用可以删掉或者留着，反正我们不会去调用它们
-#include "ctxbridges/virgl_bridge.h" 
-#include "ctxbridges/osm_bridge.h"
-
 #define GLFW_CLIENT_API 0x22001
 #define GLFW_NO_API 0
 #define GLFW_OPENGL_API 0x30001
@@ -37,51 +33,43 @@ EXTERNAL_API EGLConfig config = NULL;
 EXTERNAL_API struct PotatoBridge potatoBridge;
 
 // --------------------------------------------------------------------------
-// [必须] LWJGL 函数获取器 (硬编码系统路径)
+// [核心] LWJGL 函数获取器
 // --------------------------------------------------------------------------
 EXTERNAL_API void* pojavGetProcAddress(const char* procname) {
-    // 1. 尝试默认查找
+    // 1. 先尝试全局查找 (得益于 egl_loader.c 的 RTLD_GLOBAL，这应该能成)
     void* addr = dlsym(RTLD_DEFAULT, procname);
-    
-    // 2. 强制去系统 GLESv2 库找 (绝对路径，防止找到 gl4es)
-    if (!addr) {
-        static void* sys_gles = NULL;
-        // 懒加载系统库句柄
-        if (!sys_gles) sys_gles = dlopen("/system/lib64/libGLESv2.so", RTLD_LAZY);
-        if (!sys_gles) sys_gles = dlopen("/system/lib/libGLESv2.so", RTLD_LAZY);
-        
-        if (sys_gles) addr = dlsym(sys_gles, procname);
+    if (addr) return addr;
+
+    // 2. 如果不行，手动加载 libGLESv2.so (使用文件名，让 Linker 自己找)
+    static void* sys_gles = NULL;
+    if (!sys_gles) {
+        // 使用 RTLD_GLOBAL 再次尝试暴露符号
+        sys_gles = dlopen("libGLESv2.so", RTLD_GLOBAL | RTLD_LAZY);
+        if (!sys_gles) sys_gles = dlopen("/system/lib64/libGLESv2.so", RTLD_GLOBAL | RTLD_LAZY);
     }
+    
+    if (sys_gles) addr = dlsym(sys_gles, procname);
     return addr;
 }
 
 // --------------------------------------------------------------------------
-// 初始化：无视选项，强制加载
+// 初始化
 // --------------------------------------------------------------------------
 int pojavInitOpenGL() {
-    printf("EGLBridge: Ignoring POJAV_RENDERER. Forcing SYSTEM GLES.\n");
-
-    // 设置逻辑状态为 GL4ES，因为我们要复用它的 br_init 代码路径
-    // 但因为我们在 egl_loader.c 里硬编码了加载逻辑，所以实际加载的是 System EGL
+    printf("EGLBridge: Force SYSTEM GLES (Global Scope)...\n");
     pojav_environ->config_renderer = RENDERER_GL4ES;
-
-    // 清除环境变量，防止干扰
     unsetenv("LIBGL_EGL");
     unsetenv("LIBGL_GLES");
     unsetenv("POJAVEXEC_EGL");
-    unsetenv("GALLIUM_DRIVER"); 
 
-    // 调用 egl_loader.c (它现在只加载 /system/lib64/libEGL.so)
     set_gl_bridge_tbl(); 
     
-    // 使用 EGL 创建 Display 和 Context
     if (br_init()) {
         br_setup_window();
     } else {
-        printf("EGLBridge: [FATAL] br_init (EGL setup) failed!\n");
+        printf("EGLBridge: br_init failed!\n");
         return -1;
     }
-    
     return 0;
 }
 
@@ -90,38 +78,23 @@ EXTERNAL_API int pojavInit() {
     ANativeWindow_acquire(pojav_environ->pojavWindow);
     pojav_environ->savedWidth = ANativeWindow_getWidth(pojav_environ->pojavWindow);
     pojav_environ->savedHeight = ANativeWindow_getHeight(pojav_environ->pojavWindow);
-    
-    // 强制 RGBA 8888
     ANativeWindow_setBuffersGeometry(pojav_environ->pojavWindow, 
                                      pojav_environ->savedWidth, 
                                      pojav_environ->savedHeight, 
                                      AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
-    
     setenv("VULKAN_PTR", "0", 1); 
-
     if (pojavInitOpenGL() != 0) return 0;
     return 1;
 }
 
-// --------------------------------------------------------------------------
-// 杂项接口
-// --------------------------------------------------------------------------
-EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
-    // 允许任何 API 请求，我们的 Hook 会处理
-}
-
-EXTERNAL_API void* pojavCreateContext(void* contextSrc) {
-    // 永远只走 br_init_context (EGL)
-    return br_init_context((basic_render_window_t*)contextSrc);
-}
-
+EXTERNAL_API void pojavSetWindowHint(int hint, int value) { /* Hooked */ }
+EXTERNAL_API void* pojavCreateContext(void* contextSrc) { return br_init_context((basic_render_window_t*)contextSrc); }
 EXTERNAL_API void pojavSwapBuffers() { br_swap_buffers(); }
 EXTERNAL_API void pojavMakeCurrent(void* window) { br_make_current((basic_render_window_t*)window); }
 EXTERNAL_API void pojavSwapInterval(int interval) { br_swap_interval(interval); }
+EXTERNAL_API void pojavTerminate() { }
 EXTERNAL_API void* pojavGetCurrentContext() { return br_get_current(); }
-EXTERNAL_API void pojavTerminate() { /* cleanup */ }
 
-// JNI
 JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_utils_JREUtils_setupBridgeWindow(JNIEnv* env, ABI_COMPAT jclass clazz, jobject surface) {
     pojav_environ->pojavWindow = ANativeWindow_fromSurface(env, surface);
     if (br_setup_window) br_setup_window();
