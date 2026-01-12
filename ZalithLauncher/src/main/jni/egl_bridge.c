@@ -32,40 +32,59 @@
 EXTERNAL_API EGLConfig config = NULL;
 EXTERNAL_API struct PotatoBridge potatoBridge;
 
-// ==========================================================================
-// [核心] GLESv2 句柄
-// ==========================================================================
 static void* g_GLESv2_Handle = NULL;
 
+// --------------------------------------------------------------------------
+// [调试] 函数地址获取器
+// --------------------------------------------------------------------------
 EXTERNAL_API void* pojavGetProcAddress(const char* procname) {
     if (!procname) return NULL;
+    
+    // [DEBUG] 打印 LWJGL 请求的函数名
+    // printf("EGLBridge: Requesting symbol: %s\n", procname);
 
-    // 1. 优先从我们显式加载的 GLESv2 句柄中找
+    void* addr = NULL;
+
+    // 1. 优先从显式加载的 GLESv2 句柄找
     if (g_GLESv2_Handle) {
-        void* addr = dlsym(g_GLESv2_Handle, procname);
-        if (addr) return addr;
+        addr = dlsym(g_GLESv2_Handle, procname);
     }
 
-    // 2. 尝试全局查找
-    return dlsym(RTLD_DEFAULT, procname);
+    // 2. 如果没找到，尝试全局查找
+    if (!addr) {
+        addr = dlsym(RTLD_DEFAULT, procname);
+    }
+    
+    // [DEBUG] 如果找到了核心函数，打印出来确认
+    if (addr && strcmp(procname, "glGetString") == 0) {
+        printf("EGLBridge: FOUND glGetString at %p\n", addr);
+    }
+
+    return addr;
 }
 
 // --------------------------------------------------------------------------
 // 初始化
 // --------------------------------------------------------------------------
 int pojavInitOpenGL() {
-    printf("EGLBridge: Force SYSTEM GLES (Filename Mode)...\n");
+    printf("EGLBridge: Force SYSTEM GLES (Global + Filename Mode)...\n");
 
-    // [关键] 使用文件名加载，符合 Android NDK 规范
-    // 只要你的 APK lib 目录里没有 libGLESv2.so，它就会去加载系统的
+    // [关键修复] 使用 RTLD_GLOBAL | RTLD_LAZY
+    // 这会将符号暴露给全局，极大增加 LWJGL 找到它们的概率
+    int flags = RTLD_GLOBAL | RTLD_LAZY;
+
     if (!g_GLESv2_Handle) {
-        g_GLESv2_Handle = dlopen("libGLESv2.so", RTLD_GLOBAL | RTLD_LAZY);
+        // 使用文件名加载，符合 NDK 规范
+        g_GLESv2_Handle = dlopen("libGLESv2.so", flags);
+        
+        // 绝对路径回退
+        if (!g_GLESv2_Handle) g_GLESv2_Handle = dlopen("/system/lib64/libGLESv2.so", flags);
+        if (!g_GLESv2_Handle) g_GLESv2_Handle = dlopen("/system/lib/libGLESv2.so", flags);
         
         if (g_GLESv2_Handle) {
-            printf("EGLBridge: Loaded 'libGLESv2.so' at %p\n", g_GLESv2_Handle);
+            printf("EGLBridge: Loaded 'libGLESv2.so' at %p (GLOBAL)\n", g_GLESv2_Handle);
         } else {
-            printf("EGLBridge: [FATAL] Failed to load 'libGLESv2.so'! Error: %s\n", dlerror());
-            // 如果这里失败了，说明环境严重异常
+            printf("EGLBridge: [FATAL] Failed to load 'libGLESv2.so'!\n");
             abort(); 
         }
     }
@@ -91,21 +110,24 @@ EXTERNAL_API int pojavInit() {
     ANativeWindow_acquire(pojav_environ->pojavWindow);
     pojav_environ->savedWidth = ANativeWindow_getWidth(pojav_environ->pojavWindow);
     pojav_environ->savedHeight = ANativeWindow_getHeight(pojav_environ->pojavWindow);
-    
     ANativeWindow_setBuffersGeometry(pojav_environ->pojavWindow, 
                                      pojav_environ->savedWidth, 
                                      pojav_environ->savedHeight, 
                                      AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
     setenv("VULKAN_PTR", "0", 1); 
-
     if (pojavInitOpenGL() != 0) return 0;
     return 1;
+}
+
+// [DEBUG] 增加 MakeCurrent 的日志，确保上下文切换成功
+EXTERNAL_API void pojavMakeCurrent(void* window) { 
+    // printf("EGLBridge: pojavMakeCurrent called.\n");
+    br_make_current((basic_render_window_t*)window); 
 }
 
 EXTERNAL_API void pojavSetWindowHint(int hint, int value) { }
 EXTERNAL_API void* pojavCreateContext(void* contextSrc) { return br_init_context((basic_render_window_t*)contextSrc); }
 EXTERNAL_API void pojavSwapBuffers() { br_swap_buffers(); }
-EXTERNAL_API void pojavMakeCurrent(void* window) { br_make_current((basic_render_window_t*)window); }
 EXTERNAL_API void pojavSwapInterval(int interval) { br_swap_interval(interval); }
 EXTERNAL_API void pojavTerminate() { }
 EXTERNAL_API void* pojavGetCurrentContext() { return br_get_current(); }
