@@ -36,6 +36,8 @@
 /* Consider GLFW_NO_API as Vulkan API */
 #define GLFW_NO_API 0
 #define GLFW_OPENGL_API 0x30001
+// [ADD] 新增 GLES API 定义
+#define GLFW_OPENGL_ES_API 0x30002
 
 // This means that the function is an external API and that it will be used
 #define EXTERNAL_API __attribute__((used))
@@ -117,26 +119,57 @@ void load_vulkan() {
 
 int pojavInitOpenGL() {
     const char *forceVsync = getenv("FORCE_VSYNC");
-    if (!strcmp(forceVsync, "true"))
+    if (forceVsync && !strcmp(forceVsync, "true"))
         pojav_environ->force_vsync = true;
 
+    // 获取渲染器配置
     const char *renderer = getenv("POJAV_RENDERER");
+    
+    // [MODIFIED] 如果未设置渲染器，默认回退到 system_gles (原生GLES模式)
+    if (renderer == NULL || renderer[0] == '\0') {
+        renderer = "system_gles";
+    }
 
     load_vulkan();
 
-    if (!strncmp("opengles", renderer, 8))
+    // -------------------------------------------------------------
+    // [ADD] 纯净系统 GLES 模式 (Qualcomm/Mali/PowerVR)
+    // -------------------------------------------------------------
+    if (!strcmp(renderer, "system_gles"))
+    {
+        printf("EGLBridge: Selecting SYSTEM GLES driver mode...\n");
+        
+        // 我们复用 GL4ES 的逻辑路径，因为本质都是基于 EGL 的上下文管理
+        pojav_environ->config_renderer = RENDERER_GL4ES;
+
+        // 强制设置环境变量指向 Android 系统库 (arm64 路径)
+        // 这一步告诉底层的 egl_loader.c 去哪里 dlopen
+        setenv("LIBGL_EGL", "/system/lib64/libEGL.so", 1);
+        setenv("LIBGL_GLES", "/system/lib64/libGLESv2.so", 1);
+        setenv("LIBGL_ES", "/system/lib64/libGLESv2.so", 1); // 部分 loader 可能检查这个
+        
+        // 加载函数指针表
+        // 注意：这里我们使用 set_gl_bridge_tbl，它会去 dlsym 上面指定的系统库
+        set_gl_bridge_tbl();
+        
+        printf("EGLBridge: System drivers configured (/system/lib64).\n");
+    }
+    // -------------------------------------------------------------
+    // 传统的 gl4es 模式 (用于翻译 Desktop GL)
+    else if (!strncmp("opengles", renderer, 8))
     {
         pojav_environ->config_renderer = RENDERER_GL4ES;
+        // 注意：这里通常依赖 Java 层设置 LIBGL_EGL 指向 libgl4es.so
         set_gl_bridge_tbl();
     }
 
-    if (!strcmp(renderer, "custom_gallium"))
+    else if (!strcmp(renderer, "custom_gallium"))
     {
         pojav_environ->config_renderer = RENDERER_VK_ZINK;
         set_osm_bridge_tbl();
     }
 
-    if (!strcmp(renderer, "vulkan_zink"))
+    else if (!strcmp(renderer, "vulkan_zink"))
     {
         pojav_environ->config_renderer = RENDERER_VK_ZINK;
         load_vulkan();
@@ -144,7 +177,7 @@ int pojavInitOpenGL() {
         set_osm_bridge_tbl();
     }
 
-    if (!strcmp(renderer, "gallium_freedreno"))
+    else if (!strcmp(renderer, "gallium_freedreno"))
     {
         pojav_environ->config_renderer = RENDERER_VK_ZINK;
         setenv("MESA_LOADER_DRIVER_OVERRIDE", "kgsl", 1);
@@ -152,7 +185,7 @@ int pojavInitOpenGL() {
         set_osm_bridge_tbl();
     }
 
-    if (!strcmp(renderer, "gallium_panfrost"))
+    else if (!strcmp(renderer, "gallium_panfrost"))
     {
         pojav_environ->config_renderer = RENDERER_VK_ZINK;
         setenv("GALLIUM_DRIVER", "panfrost", 1);
@@ -160,14 +193,14 @@ int pojavInitOpenGL() {
         set_osm_bridge_tbl();
     }
 
-    if (!strcmp(renderer, "gallium_virgl"))
+    else if (!strcmp(renderer, "gallium_virgl"))
     {
         pojav_environ->config_renderer = RENDERER_VIRGL;
         setenv("GALLIUM_DRIVER", "virpipe", 1);
         setenv("OSMESA_NO_FLUSH_FRONTBUFFER", "1", false);
         setenv("MESA_GL_VERSION_OVERRIDE", "4.3", 1);
         setenv("MESA_GLSL_VERSION_OVERRIDE", "430", 1);
-        if (!strcmp(getenv("OSMESA_NO_FLUSH_FRONTBUFFER"), "1"))
+        if (getenv("OSMESA_NO_FLUSH_FRONTBUFFER") && !strcmp(getenv("OSMESA_NO_FLUSH_FRONTBUFFER"), "1"))
             printf("VirGL: OSMesa buffer flush is DISABLED!\n");
         loadSymbolsVirGL();
         virglInit();
@@ -197,8 +230,11 @@ EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
             // pojavInitVulkan();
             break;
         case GLFW_OPENGL_API:
-            /* Nothing to do: initialization is called in pojavCreateContext */
-            // pojavInitOpenGL();
+        case GLFW_OPENGL_ES_API: // [MODIFIED] 允许 ES API 请求
+            /* * LWJGL 如果请求 GLES，会发送 0x30002。
+             * 我们在这里捕获它，并让它继续走 EGL 初始化流程。
+             * 上下文版本由 br_init_context 里的 eglCreateContext 属性决定。
+             */
             break;
         default:
             printf("GLFW: Unimplemented API 0x%x\n", value);
@@ -246,9 +282,6 @@ EXTERNAL_API void* pojavCreateContext(void* contextSrc) {
 }
 
 void* maybe_load_vulkan() {
-    // We use the env var because
-    // 1. it's easier to do that
-    // 2. it won't break if something will try to load vulkan and osmesa simultaneously
     if(getenv("VULKAN_PTR") == NULL) load_vulkan();
     return (void*) strtoul(getenv("VULKAN_PTR"), NULL, 0x10);
 }
@@ -292,4 +325,3 @@ EXTERNAL_API void pojavSwapInterval(int interval) {
     }
 
 }
-
