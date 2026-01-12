@@ -1,13 +1,17 @@
 //
 // Created by maks on 21.09.2022.
+// Modified for System GLES Support
 //
 #include <stddef.h>
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <stdio.h> // Added for printf
 #include "br_loader.h"
 #include "egl_loader.h"
+#include <EGL/egl.h> // Ensure we have EGL definitions
 
+// Global function pointers
 EGLBoolean (*eglMakeCurrent_p) (EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
 EGLBoolean (*eglDestroyContext_p) (EGLDisplay dpy, EGLContext ctx);
 EGLBoolean (*eglDestroySurface_p) (EGLDisplay dpy, EGLSurface surface);
@@ -28,43 +32,91 @@ EGLBoolean (*eglSwapInterval_p) (EGLDisplay dpy, EGLint interval);
 EGLSurface (*eglGetCurrentSurface_p) (EGLint readdraw);
 EGLBoolean (*eglQuerySurface_p)(EGLDisplay display, EGLSurface surface, EGLint attribute, EGLint * value);
 
+// -------------------------------------------------------------------------
+// [HOOK] 自定义 eglBindAPI，强制 GLES
+// -------------------------------------------------------------------------
+static EGLBoolean (*real_eglBindAPI)(EGLenum api) = NULL;
+
+static EGLBoolean my_hooked_eglBindAPI(EGLenum api) {
+    // 无论调用者想绑什么 (比如 EGL_OPENGL_API)，强制绑 GLES
+    // 0x30A0 = EGL_OPENGL_ES_API
+    printf("egl_loader: [HOOK] eglBindAPI intercepted. Forcing EGL_OPENGL_ES_API (0x30A0)\n");
+    if (real_eglBindAPI) {
+        return real_eglBindAPI(0x30A0);
+    }
+    return EGL_FALSE;
+}
+
+// -------------------------------------------------------------------------
+// 加载逻辑
+// -------------------------------------------------------------------------
 void dlsym_EGL() {
     void* dl_handle = NULL;
-    char* eglName = NULL;
-    char* gles = getenv("LIBGL_GLES");
+    
+    // [MOD] 1. 优先检查是否启用了系统 GLES 模式
+    // 我们约定：如果环境变量 POJAV_RENDERER=system_gles，则强制加载系统库
+    const char* renderer = getenv("POJAV_RENDERER");
+    int use_system_gles = (renderer && strcmp(renderer, "system_gles") == 0);
 
-    if (gles && !strncmp(gles, "libGLESv2_angle.so", 18))
-    {
-        eglName = "libEGL_angle.so";
-    } else {
-        eglName = getenv("POJAVEXEC_EGL");
-    }
-
-    if (eglName)
-        dl_handle = dlopen(eglName, RTLD_LOCAL | RTLD_LAZY);
-
-    if (dl_handle == NULL)
+    if (use_system_gles) {
+        printf("egl_loader: System GLES Mode detected. Loading system libEGL.so...\n");
+        // 尝试加载系统库
         dl_handle = dlopen("libEGL.so", RTLD_LOCAL | RTLD_LAZY);
+        if (!dl_handle) dl_handle = dlopen("/system/lib64/libEGL.so", RTLD_LOCAL | RTLD_LAZY);
+        if (!dl_handle) dl_handle = dlopen("/system/lib/libEGL.so", RTLD_LOCAL | RTLD_LAZY);
+        
+        if (!dl_handle) {
+            printf("egl_loader: [FATAL] Failed to load system libEGL.so: %s\n", dlerror());
+            abort();
+        }
+    } else {
+        // 原版加载逻辑 (gl4es / ANGLE)
+        char* eglName = NULL;
+        char* gles = getenv("LIBGL_GLES");
+
+        if (gles && !strncmp(gles, "libGLESv2_angle.so", 18)) {
+            eglName = "libEGL_angle.so";
+        } else {
+            eglName = getenv("POJAVEXEC_EGL");
+        }
+
+        if (eglName) dl_handle = dlopen(eglName, RTLD_LOCAL | RTLD_LAZY);
+        if (dl_handle == NULL) dl_handle = dlopen("libEGL.so", RTLD_LOCAL | RTLD_LAZY);
+    }
 
     if (dl_handle == NULL) abort();
 
-    eglBindAPI_p = GLGetProcAddress(dl_handle, "eglBindAPI");
-    eglChooseConfig_p = GLGetProcAddress(dl_handle, "eglChooseConfig");
-    eglCreateContext_p = GLGetProcAddress(dl_handle, "eglCreateContext");
-    eglCreatePbufferSurface_p = GLGetProcAddress(dl_handle, "eglCreatePbufferSurface");
-    eglCreateWindowSurface_p = GLGetProcAddress(dl_handle, "eglCreateWindowSurface");
-    eglDestroyContext_p = GLGetProcAddress(dl_handle, "eglDestroyContext");
-    eglDestroySurface_p = GLGetProcAddress(dl_handle, "eglDestroySurface");
-    eglGetConfigAttrib_p = GLGetProcAddress(dl_handle, "eglGetConfigAttrib");
-    eglGetCurrentContext_p = GLGetProcAddress(dl_handle, "eglGetCurrentContext");
-    eglGetDisplay_p = GLGetProcAddress(dl_handle, "eglGetDisplay");
-    eglGetError_p = GLGetProcAddress(dl_handle, "eglGetError");
-    eglInitialize_p = GLGetProcAddress(dl_handle, "eglInitialize");
-    eglMakeCurrent_p = GLGetProcAddress(dl_handle, "eglMakeCurrent");
-    eglSwapBuffers_p = GLGetProcAddress(dl_handle, "eglSwapBuffers");
-    eglReleaseThread_p = GLGetProcAddress(dl_handle, "eglReleaseThread");
-    eglSwapInterval_p = GLGetProcAddress(dl_handle, "eglSwapInterval");
-    eglTerminate_p = GLGetProcAddress(dl_handle, "eglTerminate");
-    eglGetCurrentSurface_p = GLGetProcAddress(dl_handle,"eglGetCurrentSurface");
-    eglQuerySurface_p = GLGetProcAddress(dl_handle, "eglQuerySurface");
+    // 加载函数指针
+    // 注意：系统库通常用 dlsym 就能拿到，GLGetProcAddress 内部通常也是 dlsym
+    #define LOAD_EGL(name) name##_p = (typeof(name##_p))dlsym(dl_handle, #name); if(!name##_p) name##_p = (typeof(name##_p))dlsym(RTLD_DEFAULT, #name);
+
+    LOAD_EGL(eglBindAPI);
+    LOAD_EGL(eglChooseConfig);
+    LOAD_EGL(eglCreateContext);
+    LOAD_EGL(eglCreatePbufferSurface);
+    LOAD_EGL(eglCreateWindowSurface);
+    LOAD_EGL(eglDestroyContext);
+    LOAD_EGL(eglDestroySurface);
+    LOAD_EGL(eglGetConfigAttrib);
+    LOAD_EGL(eglGetCurrentContext);
+    LOAD_EGL(eglGetDisplay);
+    LOAD_EGL(eglGetError);
+    LOAD_EGL(eglInitialize);
+    LOAD_EGL(eglMakeCurrent);
+    LOAD_EGL(eglSwapBuffers);
+    LOAD_EGL(eglReleaseThread);
+    LOAD_EGL(eglSwapInterval);
+    LOAD_EGL(eglTerminate);
+    LOAD_EGL(eglGetCurrentSurface);
+    LOAD_EGL(eglQuerySurface);
+
+    // [MOD] 2. 如果是系统模式，应用 API Hook
+    if (use_system_gles && eglBindAPI_p) {
+        printf("egl_loader: Applying eglBindAPI Hook...\n");
+        real_eglBindAPI = eglBindAPI_p;
+        eglBindAPI_p = my_hooked_eglBindAPI;
+        
+        // 立即调用一次，确保环境已经切换
+        my_hooked_eglBindAPI(0); 
+    }
 }
