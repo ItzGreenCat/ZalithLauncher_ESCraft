@@ -67,24 +67,32 @@ static void force_system_gles_drivers() {
 }
 
 static void force_bind_gles_api() {
-    // [FIX] 修正函数指针类型，从 void (*) 改为 EGLBoolean (*)
-    EGLBoolean (*ptr_eglBindAPI)(EGLenum) = (EGLBoolean (*)(EGLenum)) dlsym(RTLD_DEFAULT, "eglBindAPI");
+    // [FIX] 定义函数指针类型
+    typedef EGLBoolean (*eglBindAPI_t)(EGLenum);
+    typedef EGLint (*eglGetError_t)(void);
+
+    // 动态加载符号，避免链接错误
+    eglBindAPI_t ptr_eglBindAPI = (eglBindAPI_t)dlsym(RTLD_DEFAULT, "eglBindAPI");
+    eglGetError_t ptr_eglGetError = (eglGetError_t)dlsym(RTLD_DEFAULT, "eglGetError");
     
     // 如果找不到，尝试手动 dlopen 系统库
     if (!ptr_eglBindAPI) {
         void* handle = dlopen("libEGL.so", RTLD_LAZY);
         if (handle) {
-            ptr_eglBindAPI = (EGLBoolean (*)(EGLenum)) dlsym(handle, "eglBindAPI");
+            ptr_eglBindAPI = (eglBindAPI_t)dlsym(handle, "eglBindAPI");
+            if (!ptr_eglGetError) ptr_eglGetError = (eglGetError_t)dlsym(handle, "eglGetError");
         }
     }
 
     if (ptr_eglBindAPI) {
         printf("EGLBridge: FORCE calling eglBindAPI(EGL_OPENGL_ES_API)...\n");
-        // 现在这里不会报错了，因为返回值是 EGLBoolean (int)
-        if (ptr_eglBindAPI(0x30A0)) { // 0x30A0 = EGL_OPENGL_ES_API
+        // 0x30A0 = EGL_OPENGL_ES_API
+        if (ptr_eglBindAPI(0x30A0)) {
             printf("EGLBridge: API Bind Success.\n");
         } else {
-            printf("EGLBridge: API Bind Failed (eglGetError: 0x%x)\n", eglGetError());
+            // [FIX] 使用动态加载的指针调用 eglGetError，或者 fallback 到 0
+            EGLint err = (ptr_eglGetError) ? ptr_eglGetError() : 0;
+            printf("EGLBridge: API Bind Failed (eglGetError: 0x%x)\n", err);
         }
     } else {
         printf("EGLBridge: WARNING - eglBindAPI symbol not found. EGL might default to Desktop GL.\n");
