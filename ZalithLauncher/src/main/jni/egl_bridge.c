@@ -21,6 +21,10 @@
 #include "utils.h"
 #include "ctxbridges/bridge_tbl.h"
 
+// 那些 VirGL 的引用可以删掉或者留着，反正我们不会去调用它们
+#include "ctxbridges/virgl_bridge.h" 
+#include "ctxbridges/osm_bridge.h"
+
 #define GLFW_CLIENT_API 0x22001
 #define GLFW_NO_API 0
 #define GLFW_OPENGL_API 0x30001
@@ -33,43 +37,48 @@ EXTERNAL_API EGLConfig config = NULL;
 EXTERNAL_API struct PotatoBridge potatoBridge;
 
 // --------------------------------------------------------------------------
-// [必须] 函数地址获取器
+// [必须] LWJGL 函数获取器 (硬编码系统路径)
 // --------------------------------------------------------------------------
 EXTERNAL_API void* pojavGetProcAddress(const char* procname) {
-    // 1. 尝试 dlsym (从全局或者系统库)
+    // 1. 尝试默认查找
     void* addr = dlsym(RTLD_DEFAULT, procname);
     
-    // 2. 如果全局找不到，强制去 libGLESv2 找
+    // 2. 强制去系统 GLESv2 库找 (绝对路径，防止找到 gl4es)
     if (!addr) {
         static void* sys_gles = NULL;
-        if (!sys_gles) sys_gles = dlopen("libGLESv2.so", RTLD_LAZY);
+        // 懒加载系统库句柄
+        if (!sys_gles) sys_gles = dlopen("/system/lib64/libGLESv2.so", RTLD_LAZY);
+        if (!sys_gles) sys_gles = dlopen("/system/lib/libGLESv2.so", RTLD_LAZY);
+        
         if (sys_gles) addr = dlsym(sys_gles, procname);
     }
     return addr;
 }
 
 // --------------------------------------------------------------------------
-// 初始化：无视一切，只走一条路
+// 初始化：无视选项，强制加载
 // --------------------------------------------------------------------------
 int pojavInitOpenGL() {
-    printf("EGLBridge: Force-Loading System GLES...\n");
+    printf("EGLBridge: Ignoring POJAV_RENDERER. Forcing SYSTEM GLES.\n");
 
-    // 欺骗 Pojav 认为它是 GL4ES 模式
-    // 这样它就会调用 set_gl_bridge_tbl -> egl_loader.c
+    // 设置逻辑状态为 GL4ES，因为我们要复用它的 br_init 代码路径
+    // 但因为我们在 egl_loader.c 里硬编码了加载逻辑，所以实际加载的是 System EGL
     pojav_environ->config_renderer = RENDERER_GL4ES;
 
-    // 清除可能导致干扰的变量
+    // 清除环境变量，防止干扰
     unsetenv("LIBGL_EGL");
     unsetenv("LIBGL_GLES");
+    unsetenv("POJAVEXEC_EGL");
+    unsetenv("GALLIUM_DRIVER"); 
+
+    // 调用 egl_loader.c (它现在只加载 /system/lib64/libEGL.so)
+    set_gl_bridge_tbl(); 
     
-    // 加载函数 (这里会触发我们改写过的 egl_loader.c)
-    set_gl_bridge_tbl();
-    
-    // 初始化 EGL
+    // 使用 EGL 创建 Display 和 Context
     if (br_init()) {
         br_setup_window();
     } else {
-        printf("EGLBridge: [FATAL] br_init failed.\n");
+        printf("EGLBridge: [FATAL] br_init (EGL setup) failed!\n");
         return -1;
     }
     
@@ -88,28 +97,31 @@ EXTERNAL_API int pojavInit() {
                                      pojav_environ->savedHeight, 
                                      AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
     
-    // 禁用 Vulkan
     setenv("VULKAN_PTR", "0", 1); 
 
     if (pojavInitOpenGL() != 0) return 0;
     return 1;
 }
 
+// --------------------------------------------------------------------------
+// 杂项接口
+// --------------------------------------------------------------------------
 EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
-    if (hint != GLFW_CLIENT_API) return;
-    // 不做任何事，也不崩溃，全部交给 egl_loader 里的 Hook 处理
+    // 允许任何 API 请求，我们的 Hook 会处理
 }
 
-// 标准接口直接透传
 EXTERNAL_API void* pojavCreateContext(void* contextSrc) {
+    // 永远只走 br_init_context (EGL)
     return br_init_context((basic_render_window_t*)contextSrc);
 }
+
 EXTERNAL_API void pojavSwapBuffers() { br_swap_buffers(); }
 EXTERNAL_API void pojavMakeCurrent(void* window) { br_make_current((basic_render_window_t*)window); }
 EXTERNAL_API void pojavSwapInterval(int interval) { br_swap_interval(interval); }
-EXTERNAL_API void pojavTerminate() { /* cleanup */ }
 EXTERNAL_API void* pojavGetCurrentContext() { return br_get_current(); }
+EXTERNAL_API void pojavTerminate() { /* cleanup */ }
 
+// JNI
 JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_utils_JREUtils_setupBridgeWindow(JNIEnv* env, ABI_COMPAT jclass clazz, jobject surface) {
     pojav_environ->pojavWindow = ANativeWindow_fromSurface(env, surface);
     if (br_setup_window) br_setup_window();
